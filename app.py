@@ -384,7 +384,7 @@ def render_sidebar(scheme_names: list, rag_status: str):
         st.markdown(
             '<p style="font-size:0.75rem;opacity:0.55;line-height:1.6;">'
             "Built with LangChain · FAISS · Gemini · Streamlit<br>"
-            "© 2025 GreenGov AI</p>",
+            "© 2026 GreenGov AI by Prakarsh Gupta</p>",
             unsafe_allow_html=True,
         )
 
