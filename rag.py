@@ -7,13 +7,15 @@ import os
 import hashlib
 import pickle
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
+# Updated imports for newer LangChain versions
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 
 # ─────────────────────────────────────────────
@@ -42,11 +44,14 @@ def _compute_pdf_hash(pdf_paths: List[Path]) -> str:
     return hasher.hexdigest()
 
 
-def _load_cached_hash() -> str | None:
+def _load_cached_hash() -> Optional[str]:
     """Load the previously stored PDF hash (if any)."""
     if HASH_CACHE_PATH.exists():
-        with open(HASH_CACHE_PATH, "rb") as f:
-            return pickle.load(f)
+        try:
+            with open(HASH_CACHE_PATH, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
     return None
 
 
@@ -78,7 +83,10 @@ def load_pdf_documents() -> List[Document]:
             # Tag each page with its source scheme name
             for page in pages:
                 page.metadata["scheme_name"] = pdf_path.stem
+                if "source" not in page.metadata:
+                    page.metadata["source"] = pdf_path.name
             documents.extend(pages)
+            print(f"[RAG] Loaded {pdf_path.name} ({len(pages)} pages)")
         except Exception as e:
             print(f"[RAG] Warning: Could not load {pdf_path.name}: {e}")
 
@@ -93,8 +101,11 @@ def chunk_documents(documents: List[Document]) -> List[Document]:
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", ". ", " ", ""],
+        length_function=len,
     )
-    return splitter.split_documents(documents)
+    chunks = splitter.split_documents(documents)
+    print(f"[RAG] Created {len(chunks)} chunks from {len(documents)} documents")
+    return chunks
 
 
 # ─────────────────────────────────────────────
@@ -119,26 +130,31 @@ def save_vectorstore(vectorstore: FAISS) -> None:
     vectorstore.save_local(str(VECTORSTORE_PATH))
 
 
-def load_vectorstore(api_key: str) -> FAISS | None:
+def load_vectorstore(api_key: str) -> Optional[FAISS]:
     """Load FAISS index from disk if it exists."""
     if not VECTORSTORE_PATH.exists():
         return None
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=api_key,
-    )
-    return FAISS.load_local(
-        str(VECTORSTORE_PATH),
-        embeddings,
-        allow_dangerous_deserialization=True,
-    )
+    try:
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=api_key,
+        )
+        vectorstore = FAISS.load_local(
+            str(VECTORSTORE_PATH),
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+        return vectorstore
+    except Exception as e:
+        print(f"[RAG] Could not load cached vectorstore: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────
 # Main Initialization Entry Point
 # ─────────────────────────────────────────────
 
-def initialize_rag(api_key: str) -> Tuple[FAISS | None, List[str], str]:
+def initialize_rag(api_key: str) -> Tuple[Optional[FAISS], List[str], str]:
     """
     Full RAG initialization:
     1. Detect PDFs in /data
@@ -146,6 +162,9 @@ def initialize_rag(api_key: str) -> Tuple[FAISS | None, List[str], str]:
     3. Rebuild if needed
     4. Return (vectorstore, scheme_names, status_message)
     """
+    if not api_key:
+        return None, [], "no_api_key"
+    
     pdf_paths = list(DATA_DIR.glob("*.pdf"))
     scheme_names = [p.stem for p in pdf_paths]
 
@@ -156,13 +175,17 @@ def initialize_rag(api_key: str) -> Tuple[FAISS | None, List[str], str]:
     cached_hash = _load_cached_hash()
 
     # Use cached FAISS if PDFs haven't changed
-    if current_hash == cached_hash and VECTORSTORE_PATH.exists():
+    if current_hash == cached_hash:
         vectorstore = load_vectorstore(api_key)
         if vectorstore:
             return vectorstore, scheme_names, "loaded_cache"
 
     # Rebuild from scratch
+    print("[RAG] Building new vector store...")
     documents = load_pdf_documents()
+    if not documents:
+        return None, scheme_names, "no_documents_loaded"
+    
     chunks = chunk_documents(documents)
     vectorstore = build_vectorstore(chunks, api_key)
     save_vectorstore(vectorstore)
@@ -195,16 +218,21 @@ def format_context(docs: List[Document]) -> Tuple[str, List[str]]:
     Format retrieved documents into a context string and source list.
     Returns (context_text, sources_list).
     """
+    if not docs:
+        return "No relevant documents found.", []
+    
     context_parts = []
     sources = []
 
     for i, doc in enumerate(docs, 1):
         scheme = doc.metadata.get("scheme_name", "Unknown Scheme")
         page = doc.metadata.get("page", "?")
+        source = doc.metadata.get("source", f"{scheme}.pdf")
+        
         context_parts.append(
-            f"[Source {i} — {scheme}, Page {page}]\n{doc.page_content.strip()}"
+            f"[Source {i} — {scheme}, Page {page}]\n{doc.page_content.strip()[:1000]}"
         )
-        source_label = f"{scheme} (Page {page})"
+        source_label = f"{scheme} ({source}, page {page})"
         if source_label not in sources:
             sources.append(source_label)
 
