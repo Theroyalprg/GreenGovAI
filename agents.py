@@ -1,274 +1,297 @@
 """
-Agentic AI Workflow for GreenGov AI
-Implements ProfileAgent, RetrievalAgent, EligibilityAgent, and ResponseAgent
+agents.py — Agentic Workflow for GreenGov AI
+Implements ProfileAgent, RetrievalAgent, EligibilityAgent, ResponseAgent.
 """
 
-from typing import Dict, List, Tuple, Optional
-from langchain.schema import Document
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional
+
 import google.generativeai as genai
+from langchain_community.vectorstores import FAISS
 
-class ProfileAgent:
-    """Extracts user profile information from queries"""
-    
-    def __init__(self, model=None):
-        self.model = model
-        
-    def extract_profile(self, query: str) -> Dict[str, any]:
-        """Extract user details from natural language query"""
-        
-        # Simple keyword-based extraction
-        profile = {
-            "farmer_type": None,
-            "state": None,
-            "land_size": None,
-            "goal": None,
-            "original_query": query
-        }
-        
-        # Farmer type detection
-        farmer_keywords = {
-            "small": ["small farmer", "marginal", "small-scale"],
-            "large": ["large farmer", "commercial", "corporate"],
-            "organic": ["organic", "natural farming", "chemical-free"]
-        }
-        
-        for f_type, keywords in farmer_keywords.items():
-            if any(keyword in query.lower() for keyword in keywords):
-                profile["farmer_type"] = f_type
-                break
-        
-        # State extraction (common Indian states)
-        states = [
-            "punjab", "haryana", "uttar pradesh", "maharashtra", "gujarat",
-            "rajasthan", "madhya pradesh", "bihar", "west bengal", "tamil nadu",
-            "karnataka", "andhra pradesh", "telangana", "kerala", "odisha",
-            "assam", "jharkhand", "chhattisgarh"
-        ]
-        
-        for state in states:
-            if state in query.lower():
-                profile["state"] = state.title()
-                break
-        
-        # Land size extraction (hectares/acres)
-        import re
-        land_patterns = [
-            r'(\d+(?:\.\d+)?)\s*(hectares?|ha)',
-            r'(\d+(?:\.\d+)?)\s*(acres?|ac)'
-        ]
-        
-        for pattern in land_patterns:
-            match = re.search(pattern, query.lower())
-            if match:
-                profile["land_size"] = f"{match.group(1)} {match.group(2)}"
-                break
-        
-        # Goal extraction
-        goals = {
-            "solar_power": ["solar", "renewable energy", "electricity", "power", "energy"],
-            "water_conservation": ["water", "irrigation", "drip", "sprinkler", "conservation"],
-            "crop_insurance": ["insurance", "crop loss", "damage", "protection"],
-            "soil_health": ["soil", "fertility", "nutrient", "fertilizer"]
-        }
-        
-        for goal, keywords in goals.items():
-            if any(keyword in query.lower() for keyword in keywords):
-                profile["goal"] = goal.replace("_", " ").title()
-                break
-        
-        return profile
-    
-    def format_profile_prompt(self, profile: Dict) -> str:
-        """Format profile for prompt injection"""
-        parts = ["User Profile:"]
-        if profile["farmer_type"]:
-            parts.append(f"- Farmer Type: {profile['farmer_type']}")
-        if profile["state"]:
-            parts.append(f"- State: {profile['state']}")
-        if profile["land_size"]:
-            parts.append(f"- Land Size: {profile['land_size']}")
-        if profile["goal"]:
-            parts.append(f"- Goal: {profile['goal']}")
-        
-        return "\n".join(parts)
+from rag import retrieve_relevant_chunks, format_context
 
-class RetrievalAgent:
-    """Handles retrieval of relevant scheme information"""
-    
-    def __init__(self, rag_pipeline):
-        self.rag_pipeline = rag_pipeline
-    
-    def retrieve(self, query: str, profile: Dict, k: int = 5) -> List[Tuple[Document, float]]:
-        """Retrieve relevant chunks based on query and profile context"""
-        
-        # Enhance query with profile information
-        enhanced_query = query
-        if profile["state"]:
-            enhanced_query += f" in {profile['state']}"
-        if profile["goal"]:
-            enhanced_query += f" for {profile['goal']}"
-        
-        chunks = self.rag_pipeline.retrieve_relevant_chunks(enhanced_query, k=k)
-        
-        # Organize by scheme
-        schemes_info = {}
-        for doc, score in chunks:
-            scheme = doc.metadata.get("scheme_name", "Unknown")
-            if scheme not in schemes_info:
-                schemes_info[scheme] = []
-            schemes_info[scheme].append((doc, score))
-        
-        return schemes_info, chunks
 
-class EligibilityAgent:
-    """Analyzes eligibility based on user profile and scheme documents"""
-    
-    def __init__(self, model):
-        self.model = model
-    
-    def analyze_eligibility(self, profile: Dict, schemes_info: Dict) -> Dict:
-        """Analyze eligibility for each scheme"""
-        
-        eligibility_results = {}
-        
-        for scheme_name, docs in schemes_info.items():
-            # Extract key criteria from documents
-            context = "\n".join([doc.page_content[:500] for doc, _ in docs[:3]])
-            
-            prompt = f"""
-            Based on the scheme document below, analyze if the user is eligible for {scheme_name}.
-            
-            User Profile:
-            - Farmer Type: {profile.get('farmer_type', 'Not specified')}
-            - State: {profile.get('state', 'Not specified')}
-            - Land Size: {profile.get('land_size', 'Not specified')}
-            - Goal: {profile.get('goal', 'Not specified')}
-            
-            Scheme Document Excerpt:
-            {context}
-            
-            Analyze eligibility and provide:
-            1. Eligibility Status (Eligible/Partially Eligible/Not Eligible)
-            2. Key criteria that match or don't match
-            3. Specific requirements the user needs to meet
-            
-            Keep response concise and actionable.
-            """
-            
-            try:
-                response = self.model.generate_content(prompt)
-                eligibility_results[scheme_name] = response.text
-            except Exception as e:
-                eligibility_results[scheme_name] = f"Eligibility analysis unavailable: {str(e)}"
-        
-        return eligibility_results
+# ─────────────────────────────────────────────
+# Data Classes
+# ─────────────────────────────────────────────
 
-class ResponseAgent:
-    """Generates final comprehensive response for the user"""
-    
-    def __init__(self, model):
-        self.model = model
-    
-    def generate_response(self, query: str, profile: Dict, schemes_info: Dict, 
-                          eligibility_results: Dict) -> str:
-        """Generate final response with recommended schemes and details"""
-        
-        # Format context
-        context_parts = []
-        for scheme_name, docs in schemes_info.items():
-            context_parts.append(f"\n=== {scheme_name} ===\n")
-            for doc, score in docs[:2]:  # Top 2 chunks per scheme
-                context_parts.append(f"Content: {doc.page_content[:800]}")
-                context_parts.append(f"Source: {doc.metadata.get('source', 'Unknown')}\n")
-        
-        context = "\n".join(context_parts)
-        
-        # Format eligibility
-        eligibility_text = "\n".join([f"**{scheme}**:\n{analysis}" 
-                                      for scheme, analysis in eligibility_results.items()])
-        
-        prompt = f"""
-        You are GreenGov AI, an expert assistant for government sustainability schemes in India.
-        
-        User Question: {query}
-        
-        {ProfileAgent().format_profile_prompt(profile)}
-        
-        RELEVANT SCHEME DOCUMENTS:
-        {context}
-        
-        ELIGIBILITY ANALYSIS:
-        {eligibility_text}
-        
-        Please provide a comprehensive response with the following structure:
-        
-        ## 🌿 Recommended Schemes
-        (List top 2-3 most relevant schemes)
-        
-        ## ✅ Eligibility Analysis
-        (Summarize eligibility for each recommended scheme)
-        
-        ## 💰 Benefits
-        (List key benefits of recommended schemes)
-        
-        ## 📋 Required Documents
-        (List documents typically needed)
-        
-        ## 📝 Application Steps
-        (Provide clear, actionable steps)
-        
-        ## 📚 Sources Used
-        (List which documents were referenced)
-        
-        Important Guidelines:
-        - Be specific and actionable
-        - Include actual scheme names from documents
-        - Mention official government sources
-        - Add state-specific information if available
-        - Keep response professional but friendly
-        
-        ---
-        ⚠️ **Responsible AI Disclaimer**: This recommendation is based on available scheme documents and should be verified through official government portals.
-        """
-        
-        try:
-            response = self.model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            return f"Error generating response: {str(e)}\n\n---\n⚠️ This recommendation is based on available scheme documents and should be verified through official government portals."
+@dataclass
+class UserProfile:
+    """Structured user profile extracted by ProfileAgent."""
+    raw_query: str
+    state: Optional[str] = None
+    land_size: Optional[str] = None
+    crop_type: Optional[str] = None
+    water_source: Optional[str] = None
+    goal: Optional[str] = None
+    farmer_category: Optional[str] = None   # small / marginal / large
+    is_farmer: bool = True
+    extra_context: str = ""
 
-def run_agentic_workflow(query: str, rag_pipeline, model, k: int = 5) -> Dict:
+
+@dataclass
+class AgentContext:
+    """Shared context object passed through the agent pipeline."""
+    user_query: str
+    profile: Optional[UserProfile] = None
+    retrieved_docs: list = field(default_factory=list)
+    context_text: str = ""
+    sources: List[str] = field(default_factory=list)
+    eligibility_notes: str = ""
+    final_response: str = ""
+
+
+# ─────────────────────────────────────────────
+# Prompt Templates
+# ─────────────────────────────────────────────
+
+PROFILE_EXTRACTION_PROMPT = """
+You are a government scheme assistant helping Indian citizens find subsidies.
+Extract the following details from the user's query (if mentioned). 
+Return ONLY a valid JSON object with these keys — leave missing fields as null:
+
+{{
+  "state": "<Indian state name or null>",
+  "land_size": "<land size in acres/hectares or null>",
+  "crop_type": "<crop or farming type or null>",
+  "water_source": "<irrigation/water source or null>",
+  "goal": "<main goal: solar/water/seeds/insurance/irrigation/soil or null>",
+  "farmer_category": "<small/marginal/large or null>",
+  "is_farmer": true or false
+}}
+
+User Query: {query}
+"""
+
+ELIGIBILITY_PROMPT = """
+You are an expert on Indian government agricultural and sustainability schemes.
+Based on the user profile and the scheme documents below, analyze eligibility.
+
+User Profile:
+- State: {state}
+- Land Size: {land_size}
+- Crop Type: {crop_type}
+- Water Source: {water_source}
+- Goal: {goal}
+- Farmer Category: {farmer_category}
+
+Scheme Document Excerpts:
+{context}
+
+Analyze which schemes the user likely qualifies for and note any eligibility criteria 
+they should verify (land holding limits, state-specific applicability, etc.).
+Be concise — 3 to 5 bullet points.
+"""
+
+RESPONSE_GENERATION_PROMPT = """
+You are GreenGov AI — a helpful assistant that helps Indian citizens discover 
+government subsidies for clean energy, water conservation, and sustainable agriculture.
+
+User's Question: {query}
+
+User Profile Summary: {profile_summary}
+
+Eligibility Analysis: {eligibility_notes}
+
+Relevant Scheme Information:
+{context}
+
+Generate a comprehensive, citizen-friendly response in this exact structure:
+
+## 🌱 Recommended Schemes
+List the most relevant schemes by name with a one-line description of each.
+
+## ✅ Eligibility Analysis
+Summarize who qualifies and any conditions relevant to this user.
+
+## 💰 Key Benefits
+Bullet-point the main financial/material benefits available.
+
+## 📄 Required Documents
+List the typical documents needed to apply.
+
+## 📝 Application Steps
+Step-by-step instructions (numbered) on how to apply.
+
+## 📚 Sources Used
+{sources}
+
+---
+⚠️ *This recommendation is based on available scheme documents and should be 
+verified through official government portals (pmkisan.gov.in, india.gov.in, etc.).*
+"""
+
+
+# ─────────────────────────────────────────────
+# Agents
+# ─────────────────────────────────────────────
+
+def profile_agent(query: str, gemini_model) -> UserProfile:
     """
-    Execute the complete agentic workflow:
+    ProfileAgent: Extract structured user profile from the free-text query.
+    Uses Gemini to parse intent, state, land size, crop type, and goals.
+    """
+    import json
+
+    prompt = PROFILE_EXTRACTION_PROMPT.format(query=query)
+    try:
+        response = gemini_model.generate_content(prompt)
+        raw = response.text.strip()
+
+        # Strip markdown code fences if present
+        raw = re.sub(r"^```(?:json)?", "", raw).strip()
+        raw = re.sub(r"```$", "", raw).strip()
+
+        data = json.loads(raw)
+        profile = UserProfile(
+            raw_query=query,
+            state=data.get("state"),
+            land_size=data.get("land_size"),
+            crop_type=data.get("crop_type"),
+            water_source=data.get("water_source"),
+            goal=data.get("goal"),
+            farmer_category=data.get("farmer_category"),
+            is_farmer=data.get("is_farmer", True),
+        )
+    except Exception:
+        # Graceful fallback — continue with empty profile
+        profile = UserProfile(raw_query=query)
+
+    return profile
+
+
+def retrieval_agent(query: str, profile: UserProfile, vectorstore: FAISS) -> tuple:
+    """
+    RetrievalAgent: Build an enriched query from the user profile and retrieve
+    the most relevant scheme document chunks from FAISS.
+    Returns (docs, context_text, sources).
+    """
+    # Enrich the query with profile signals for better retrieval
+    enriched_parts = [query]
+    if profile.goal:
+        enriched_parts.append(profile.goal)
+    if profile.state:
+        enriched_parts.append(profile.state)
+    if profile.crop_type:
+        enriched_parts.append(profile.crop_type)
+
+    enriched_query = " ".join(enriched_parts)
+    docs = retrieve_relevant_chunks(enriched_query, vectorstore, k=6)
+    context_text, sources = format_context(docs)
+    return docs, context_text, sources
+
+
+def eligibility_agent(
+    profile: UserProfile,
+    context_text: str,
+    gemini_model,
+) -> str:
+    """
+    EligibilityAgent: Using the retrieved context and user profile, produce
+    a brief eligibility analysis to feed into the final response.
+    """
+    prompt = ELIGIBILITY_PROMPT.format(
+        state=profile.state or "Not specified",
+        land_size=profile.land_size or "Not specified",
+        crop_type=profile.crop_type or "Not specified",
+        water_source=profile.water_source or "Not specified",
+        goal=profile.goal or "General inquiry",
+        farmer_category=profile.farmer_category or "Not specified",
+        context=context_text[:3000],   # Keep prompt size manageable
+    )
+    try:
+        response = gemini_model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"Eligibility analysis unavailable: {e}"
+
+
+def response_agent(
+    query: str,
+    profile: UserProfile,
+    eligibility_notes: str,
+    context_text: str,
+    sources: List[str],
+    gemini_model,
+) -> str:
+    """
+    ResponseAgent: Generate the final structured citizen-facing response
+    combining all upstream agent outputs.
+    """
+    profile_summary = (
+        f"State: {profile.state or 'N/A'} | "
+        f"Land: {profile.land_size or 'N/A'} | "
+        f"Crop: {profile.crop_type or 'N/A'} | "
+        f"Goal: {profile.goal or 'General'} | "
+        f"Category: {profile.farmer_category or 'N/A'}"
+    )
+
+    sources_text = (
+        "\n".join(f"- {s}" for s in sources)
+        if sources else "- General scheme knowledge base"
+    )
+
+    prompt = RESPONSE_GENERATION_PROMPT.format(
+        query=query,
+        profile_summary=profile_summary,
+        eligibility_notes=eligibility_notes,
+        context=context_text,
+        sources=sources_text,
+    )
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"❌ Could not generate response: {e}"
+
+
+# ─────────────────────────────────────────────
+# Orchestrator — Full Agentic Pipeline
+# ─────────────────────────────────────────────
+
+def run_agentic_pipeline(
+    query: str,
+    vectorstore: FAISS,
+    gemini_model,
+) -> dict:
+    """
+    Orchestrates the full multi-agent workflow:
     User Query → ProfileAgent → RetrievalAgent → EligibilityAgent → ResponseAgent
+
+    Returns a dict with all intermediate results and the final answer.
     """
-    
-    # Step 1: ProfileAgent - Extract user details
-    profile_agent = ProfileAgent(model)
-    profile = profile_agent.extract_profile(query)
-    
-    # Step 2: RetrievalAgent - Get relevant schemes
-    retrieval_agent = RetrievalAgent(rag_pipeline)
-    schemes_info, all_chunks = retrieval_agent.retrieve(query, profile, k=k)
-    
-    if not schemes_info:
-        return {
-            "profile": profile,
-            "response": "No relevant scheme information found. Please try a different query or check if PDF documents are loaded properly.",
-            "schemes": []
-        }
-    
-    # Step 3: EligibilityAgent - Analyze eligibility
-    eligibility_agent = EligibilityAgent(model)
-    eligibility_results = eligibility_agent.analyze_eligibility(profile, schemes_info)
-    
-    # Step 4: ResponseAgent - Generate final answer
-    response_agent = ResponseAgent(model)
-    final_response = response_agent.generate_response(query, profile, schemes_info, eligibility_results)
-    
+    ctx = AgentContext(user_query=query)
+
+    # ── Step 1: Profile Extraction ──────────────
+    ctx.profile = profile_agent(query, gemini_model)
+
+    # ── Step 2: Retrieval ───────────────────────
+    ctx.retrieved_docs, ctx.context_text, ctx.sources = retrieval_agent(
+        query, ctx.profile, vectorstore
+    )
+
+    # ── Step 3: Eligibility Analysis ────────────
+    ctx.eligibility_notes = eligibility_agent(
+        ctx.profile, ctx.context_text, gemini_model
+    )
+
+    # ── Step 4: Response Generation ─────────────
+    ctx.final_response = response_agent(
+        query=query,
+        profile=ctx.profile,
+        eligibility_notes=ctx.eligibility_notes,
+        context_text=ctx.context_text,
+        sources=ctx.sources,
+        gemini_model=gemini_model,
+    )
+
     return {
-        "profile": profile,
-        "schemes": list(schemes_info.keys()),
-        "eligibility": eligibility_results,
-        "response": final_response
+        "response": ctx.final_response,
+        "profile": ctx.profile,
+        "sources": ctx.sources,
+        "eligibility": ctx.eligibility_notes,
+        "doc_count": len(ctx.retrieved_docs),
     }
