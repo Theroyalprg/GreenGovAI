@@ -4,11 +4,13 @@ Implements ProfileAgent, RetrievalAgent, EligibilityAgent, ResponseAgent.
 """
 
 import re
+import json
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 
 import google.generativeai as genai
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 
 from rag import retrieve_relevant_chunks, format_context
 
@@ -36,7 +38,7 @@ class AgentContext:
     """Shared context object passed through the agent pipeline."""
     user_query: str
     profile: Optional[UserProfile] = None
-    retrieved_docs: list = field(default_factory=list)
+    retrieved_docs: List[Document] = field(default_factory=list)
     context_text: str = ""
     sources: List[str] = field(default_factory=list)
     eligibility_notes: str = ""
@@ -52,7 +54,7 @@ You are a government scheme assistant helping Indian citizens find subsidies.
 Extract the following details from the user's query (if mentioned). 
 Return ONLY a valid JSON object with these keys — leave missing fields as null:
 
-{{
+{
   "state": "<Indian state name or null>",
   "land_size": "<land size in acres/hectares or null>",
   "crop_type": "<crop or farming type or null>",
@@ -60,7 +62,7 @@ Return ONLY a valid JSON object with these keys — leave missing fields as null
   "goal": "<main goal: solar/water/seeds/insurance/irrigation/soil or null>",
   "farmer_category": "<small/marginal/large or null>",
   "is_farmer": true or false
-}}
+}
 
 User Query: {query}
 """
@@ -133,8 +135,6 @@ def profile_agent(query: str, gemini_model) -> UserProfile:
     ProfileAgent: Extract structured user profile from the free-text query.
     Uses Gemini to parse intent, state, land size, crop type, and goals.
     """
-    import json
-
     prompt = PROFILE_EXTRACTION_PROMPT.format(query=query)
     try:
         response = gemini_model.generate_content(prompt)
@@ -155,14 +155,15 @@ def profile_agent(query: str, gemini_model) -> UserProfile:
             farmer_category=data.get("farmer_category"),
             is_farmer=data.get("is_farmer", True),
         )
-    except Exception:
+    except Exception as e:
+        print(f"[ProfileAgent] Error: {e}")
         # Graceful fallback — continue with empty profile
         profile = UserProfile(raw_query=query)
 
     return profile
 
 
-def retrieval_agent(query: str, profile: UserProfile, vectorstore: FAISS) -> tuple:
+def retrieval_agent(query: str, profile: UserProfile, vectorstore: FAISS) -> Tuple[List[Document], str, List[str]]:
     """
     RetrievalAgent: Build an enriched query from the user profile and retrieve
     the most relevant scheme document chunks from FAISS.
@@ -237,7 +238,7 @@ def response_agent(
         query=query,
         profile_summary=profile_summary,
         eligibility_notes=eligibility_notes,
-        context=context_text,
+        context=context_text[:4000],  # Limit context length
         sources=sources_text,
     )
 
@@ -256,7 +257,7 @@ def run_agentic_pipeline(
     query: str,
     vectorstore: FAISS,
     gemini_model,
-) -> dict:
+) -> Dict[str, Any]:
     """
     Orchestrates the full multi-agent workflow:
     User Query → ProfileAgent → RetrievalAgent → EligibilityAgent → ResponseAgent
